@@ -1,0 +1,7 @@
+INFO: log.setup - Processing bank: rbs
+INFO: log.setup - Fetching accounts for bank rbs
+ERROR: log.setup - Error fetching transactions: 404 Client Error: Not Found for url: https://api.openbankproject.com/obp/v5.0.0/banks/rbs/accounts
+ERROR: log.setup - Error in extract_all_transaction_account_ids: 404 Client Error: Not Found for url: https://api.openbankproject.com/obp/v5.0.0/banks/rbs/accounts
+ERROR: log.setup - Error running script: 404 Client Error: Not Found for url: https://api.openbankproject.com/obp/v5.0.0/banks/rbs/accounts
+ERROR: log.setup - Error listing banks: 404 Client Error: Not Found for url: https://api.openbankproject.com/obp/v5.0.0/banks
+ERROR: log.setup - Error connecting to Open Bank Project API: Invalid URL '<requests.sessions.Session object at 0x0000020265E1F210>': No scheme supplied. Perhaps you meant https://<requests.sessions.Session object at 0x0000020265E1F210>?
