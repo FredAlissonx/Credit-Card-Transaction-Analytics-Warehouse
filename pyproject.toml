@@ -10,6 +10,8 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "boto3>=1.37.37",
+    "kaggle>=1.7.4.2",
+    "kagglehub>=0.3.12",
     "pytest>=8.3.5",
     "python-dotenv>=1.1.0",
     "requests>=2.32.3",

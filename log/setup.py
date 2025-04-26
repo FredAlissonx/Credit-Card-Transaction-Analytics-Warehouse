@@ -1,7 +1,7 @@
 import logging
 
 logging.basicConfig(
-    filename="app.log",
+    filename="log/app.log",
     encoding="utf-8",
     filemode="a",
     level=logging.INFO,
