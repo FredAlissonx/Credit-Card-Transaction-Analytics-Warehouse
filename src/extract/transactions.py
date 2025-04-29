@@ -104,7 +104,6 @@ def get_dataset_path(
     data_path = define_path(path=data_path)
     api = authenticate_kaggle_api()
     
-    # If directory already has files, assume dataset is present
     if any(data_path.iterdir()):
         logger.info(f"Dataset already exists in {data_path}")
         return data_path
