@@ -1,8 +1,10 @@
 from utils.config import logger
 from pathlib import Path
+import argparse
 from kaggle.api.kaggle_api_extended import KaggleApi, RequestException
 import pandas as pd
-from utils.s3_utils import ingest_df_raw_zone_s3
+from datetime import datetime
+from utils.s3_utils import RawLayerManager
 
 def define_path(path: Path = None) -> Path:
     """
@@ -142,58 +144,53 @@ def list_dataset_files(data_path: Path) -> list:
     """
     return [f for f in data_path.iterdir() if f.is_file()]
 
-def loading_raw_data(
-    csv_path: Path,
-    ingest_fmt: str = "csv",
-    **read_csv_kwargs
-) -> pd.DataFrame:
-    """
-    Load raw credit card transaction data from a CSV file and ingest to S3.
+def ingest_raw(source: str, data_dir: Path, processing_date: datetime):
+    mgr = RawLayerManager(source)
 
-    Parameters
-    ----------
-    csv_path : pathlib.Path or str
-        Directory path where the `credit_card_transactions.{ingest_fmt}` file 
-        is located. If a directory is provided, the filename will be automatically
-        appended in the format `credit_card_transactions.{ingest_fmt}`.
-    ingest_fmt : str, optional
-        File format extension for the input data (default: 'csv'). Used to
-        construct the full filename as `credit_card_transactions.{ingest_fmt}`.
-    **read_csv_kwargs : dict, optional
-        Additional keyword arguments to pass to `pd.read_csv()`. Overrides default
-        read parameters.
+    for file in list_dataset_files(data_dir):
+        fmt = file.suffix.lstrip('.').lower()
+        logger.info(f"Ingesting RAW {file.name} as format={fmt}")
 
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame containing the loaded transaction data.
+        if fmt == 'parquet':
+            # upload bytes directly
+            body = file.read_bytes()
+            key = mgr.ingest_data(
+                df=pd.DataFrame(), 
+                processing_date=processing_date,
+                fmt='parquet',
+                partition_cols={
+                    'year': f"{processing_date:%Y}",
+                    'month': f"{processing_date:%m}",
+                    'day': f"{processing_date:%d}"
+                },
+                metadata={'original_format':'parquet'},
+                source_key=str(file)  # your override branch will catch this
+            )
+        else:
+            # read into pandas and let RawLayerManager._process_data + serialize
+            df = pd.read_csv(file) if fmt=='csv' else pd.read_json(file, lines=True)
+            key = mgr.ingest_data(
+                df,
+                processing_date,
+                fmt=fmt,
+                partition_cols={
+                    'year': f"{processing_date:%Y}",
+                    'month': f"{processing_date:%m}",
+                    'day': f"{processing_date:%d}"
+                },
+                metadata={'original_format':fmt}
+            )
 
-    Raises
-    ------
-    FileNotFoundError
-        If the constructed file path does not exist.
-    pd.errors.ParserError
-        If there are issues parsing the CSV file.
-    """
-    csv_path = Path(csv_path / f"credit_card_transactions.{ingest_fmt}")
+        logger.info(f" → raw data at s3://{mgr.bucket}/{key}")
 
-    logger.info(f"Loading raw data from {csv_path}.")
-    try:
-        defaults = dict(on_bad_lines="warn")
-        params = {**defaults, **read_csv_kwargs}
-        df = pd.read_csv(csv_path, **params)
-    except FileNotFoundError:
-        logger.error(f"CSV file not found: {csv_path}")
-        raise
-    except pd.errors.ParserError as e:
-        logger.error(f"Parsing failed for {csv_path}: {e}")
-        raise
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset', default='priyamchoksi/credit-card-transactions-dataset')
+    parser.add_argument('--data-dir', default='./data')
+    parser.add_argument('--source',   default='transactions')
+    parser.add_argument('--date',     default=None)
+    args = parser.parse_args()
 
-    logger.info(f"Successfully loaded {len(df):,} rows.")
-    ingest_df_raw_zone_s3(
-        df=df,
-        source="kaggle",
-        fmt=ingest_fmt
-    )
-    logger.info("Raw data ingestion to S3 completed.")
-    return df
+    date = datetime.strptime(args.date, '%Y-%m-%d') if args.date else datetime.now()
+    data_dir = get_dataset_path(args.dataset, Path(args.data_dir))
+    ingest_raw(args.source, data_dir, date)
