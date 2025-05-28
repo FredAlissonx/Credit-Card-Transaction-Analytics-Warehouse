@@ -1,255 +1,246 @@
 import os
 import hashlib
 from io import BytesIO
-from datetime import datetime
-
+from datetime import datetime, timedelta
+import argparse
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from typing import Optional, Dict, List, Callable
+from dataclasses import dataclass
 from utils.config import logger
 
-BOTOCORE_CONFIG = Config(
+S3_CONFIG = Config(
     retries={
-        'max_attempts': 10,
-        'mode': 'standard'
-    }
+        'max_attempts': int(os.getenv('AWS_MAX_ATTEMPTS', 10)),
+        'mode': os.getenv('AWS_RETRY_MODE', 'standard')
+    },
+    max_pool_connections=int(os.getenv('AWS_MAX_POOL_CONNECTIONS', 100))
 )
 
 SESSION = boto3.Session(
-    aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
-    aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
-    region_name=os.environ.get('AWS_REGION', 'sa-east-1'),
+    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+    region_name=os.getenv('AWS_REGION', 'us-east-1')
 )
-S3_CLIENT = SESSION.client('s3', config=BOTOCORE_CONFIG)
 
-DEFAULT_BUCKET = os.environ.get('S3_BUCKET', 'credit-card-transactions-project')
+s3_client = SESSION.client('s3', config=S3_CONFIG)
+DEFAULT_BUCKET = os.getenv('S3_BUCKET', 'credit-card-transactions-project')
 
-def _generate_s3_key(
-    source: str,
-    fmt: str,
-    ts: datetime | None = None
-) -> str:
-    """
-    Generate a Hive-style partitioned S3 object key.
+@dataclass
+class DataLakeLayer:
+    RAW: str = "raw"
+    BRONZE: str = "bronze"
+    SILVER: str = "silver"
 
-    Parameters
-    ----------
-    source : str
-        The source system or dataset name.
-    fmt : str
-        The file format extension (e.g., 'parquet', 'csv', 'json').
-    ts : datetime, optional
-        Timestamp to base partitioning on. Defaults to current time.
+class DataQualityError(Exception):
+    """Custom exception for data quality issues"""
 
-    Returns
-    -------
-    str
-        The generated S3 key, e.g.
-        'raw/source/year=YYYY/month=MM/day=DD/source_YYYYMMDD_HHMMSS.fmt'.
-    """
-    ts = ts or datetime.now()
-    return (
-        f"raw/{source}/"
-        f"year={ts:%Y}/month={ts:%m}/day={ts:%d}/"
-        f"{source}_{ts:%Y%m%d_%H%M%S}.{fmt}"
-    )
+class DataLakeManager:
+    """Base class for data lake operations"""
+    def __init__(self, source: str, layer: str, bucket: str = DEFAULT_BUCKET):
+        self.source = source
+        self.layer = layer
+        self.bucket = bucket
+        self.s3 = s3_client
 
-def _compute_checksum(
-    df: pd.DataFrame,
-    fmt: str
-) -> str:
-    """
-    Compute an MD5 checksum of a DataFrame serialized in the given format.
+    def _generate_key(
+        self, fmt: str, processing_date: datetime,
+        partition_cols: Optional[Dict[str, str]] = None
+    ) -> str:
+        """Generate S3 key with Hive-style partitioning"""
+        base_path = f"{self.layer}/{self.source}/"
+        if partition_cols:
+            partition_path = "/".join(f"{k}={v}" for k, v in partition_cols.items())
+            return f"{base_path}{partition_path}/{self.source}_{processing_date:%Y%m%d_%H%M%S}.{fmt}"
+        return f"{base_path}{self.source}_{processing_date:%Y%m%d_%H%M%S}.{fmt}"
 
-    Supports Parquet, CSV, JSON, and text fallback.
+    def _validate_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """No-op validation at base"""
+        return df
 
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        The DataFrame to checksum.
-    fmt : str
-        The serialization format ('parquet', 'csv', 'json', etc.).
+    def _process_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Data processing to be implemented by subclasses"""
+        raise NotImplementedError
 
-    Returns
-    -------
-    str
-        The MD5 checksum of the serialized DataFrame bytes.
-    """
-    buf = BytesIO()
-    fmt = fmt.lower()
-    
-    if fmt == 'parquet':
-        table = pa.Table.from_pandas(df, preserve_index=False)
-        pq.write_table(table, buf)
-    elif fmt == 'csv':
-        df.to_csv(buf, index=False)
-    elif fmt == 'json':
-        df.to_json(buf, orient='records', lines=True)
-    else:
-        buf.write(df.to_string().encode())
-    
-    buf.seek(0)
-    return hashlib.md5(buf.read()).hexdigest()
+    def _compute_checksum(self, df: pd.DataFrame, fmt: str) -> str:
+        """Compute MD5 checksum of serialized DataFrame"""
+        buf = BytesIO()
+        self._serialize_data(df, buf, fmt)
+        buf.seek(0)
+        return hashlib.md5(buf.read()).hexdigest()
 
-def ingest_df_raw_zone_s3(
-    df: pd.DataFrame,
-    source: str,
-    fmt: str,
-    bucket: str = DEFAULT_BUCKET,
-    extra_metadata: dict[str, str] | None = None
-) -> str:
-    """
-    Ingest a DataFrame into the S3 raw zone preserving 'as-is' format.
+    def _serialize_data(
+        self, df: pd.DataFrame, buf: BytesIO, fmt: str
+    ):
+        """Serialize DataFrame to different formats"""
+        fmt = fmt.lower()
+        if fmt == 'parquet':
+            pq.write_table(pa.Table.from_pandas(df, preserve_index=False), buf)
+        elif fmt == 'csv':
+            df.to_csv(buf, index=False)
+        else:
+            raise ValueError(f"Unsupported format: {fmt}")
 
-    Serializes the DataFrame to the specified format, computes a checksum,
-    and uploads it to S3 with Hive-style partitioning and metadata.
+    def load_from_previous_layer(
+        self, processing_date: datetime, fmt: str = 'parquet'
+    ) -> pd.DataFrame:
+        """Load data from previous layer with format consideration."""
+        prev = {
+            DataLakeLayer.BRONZE: DataLakeLayer.RAW,
+            DataLakeLayer.SILVER: DataLakeLayer.BRONZE
+        }[self.layer]
+        prefix = f"{prev}/{self.source}/"
 
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        The data to ingest.
-    source : str
-        The source system or dataset name.
-    fmt : str
-        The file format ('parquet', 'csv', 'json').
-    bucket : str, optional
-        The S3 bucket name. Defaults to DEFAULT_BUCKET.
-    extra_metadata : dict of str, optional
-        Additional metadata to attach to the S3 object.
+        try:
+            resp = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=prefix)
+            if 'Contents' not in resp:
+                return pd.DataFrame()
 
-    Returns
-    -------
-    str
-        The S3 key where the object was uploaded.
+            frames = []
+            for obj in resp['Contents']:
+                if not obj['Key'].endswith(f".{fmt}"):
+                    continue
+                body = self.s3.get_object(Bucket=self.bucket, Key=obj['Key'])['Body'].read()
+                if fmt == 'parquet':
+                    frames.append(pd.read_parquet(BytesIO(body)))
+                elif fmt == 'csv':
+                    frames.append(pd.read_csv(BytesIO(body)))
+            return pd.concat(frames) if frames else pd.DataFrame()
 
-    Raises
-    ------
-    ValueError
-        If the specified format is unsupported.
-    botocore.exceptions.ClientError
-        If the upload to S3 fails.
-    """
-    if df.empty:
-        logger.warning(f"No data for source={source}, skipping ingest.")
-        return ''
+        except ClientError as e:
+            logger.error(f"Error loading from {prev}: {e}")
+            raise
 
-    key = _generate_s3_key(source, fmt)
-    buf = BytesIO()
-
-    fmt = fmt.lower()
-    if fmt == 'parquet':
-        table = pa.Table.from_pandas(df, preserve_index=False)
-        pq.write_table(table, buf)
-    elif fmt == 'csv':
-        df.to_csv(buf, index=False)
-    elif fmt == 'json':
-        df.to_json(buf, orient='records', lines=True)
-    else:
-        raise ValueError(f"Unsupported format: {fmt}")
-
-    buf.seek(0)
-    checksum = _compute_checksum(df, fmt)
-
-    metadata = {
-        'source': source,
-        'rows': str(len(df)),
-        'columns': ','.join(df.columns),
-        'ingestion_time': datetime.now().isoformat(),
-        'checksum': checksum,
-        'format': fmt,
-    }
-    if extra_metadata:
-        metadata.update(extra_metadata)
-
-    try:
-        S3_CLIENT.upload_fileobj(
-            Fileobj=buf,
-            Bucket=bucket,
-            Key=key,
-            ExtraArgs={'Metadata': metadata}
-        )
-        logger.info(f"Ingested raw data to s3://{bucket}/{key}")
+    def ingest_data(
+        self, df: pd.DataFrame, processing_date: datetime,
+        fmt: str = 'parquet',
+        partition_cols: Optional[Dict[str, str]] = None,
+        metadata: Optional[Dict[str, str]] = None
+    ) -> str:
+        """Ingest processed data to target layer"""
+        if df.empty:
+            logger.warning("No data to ingest")
+            return ""
+        validated = self._validate_data(df)
+        processed = self._process_data(validated)
+        key = self._generate_key(fmt, processing_date, partition_cols)
+        if self._object_exists(key):
+            logger.info(f"Skipping existing object {key}")
+            return key
+        buf = BytesIO()
+        self._serialize_data(processed, buf, fmt)
+        buf.seek(0)
+        checksum = self._compute_checksum(processed, fmt)
+        meta = metadata or {}
+        meta.update({
+            'source': self.source,
+            'layer': self.layer,
+            'processing_date': processing_date.isoformat(),
+            'checksum': checksum,
+            'format': fmt,
+            'rows': str(len(processed)),
+            'columns': ','.join(processed.columns),
+        })
+        self.s3.upload_fileobj(Fileobj=buf, Bucket=self.bucket, Key=key, ExtraArgs={'Metadata': meta})
+        logger.info(f"Ingested to s3://{self.bucket}/{key}")
         return key
-    except ClientError as e:
-        logger.error(f"Failed ingestion for {source} to {key}: {e}")
-        raise
 
-def list_raw_objects(
-    source: str,
-    date: datetime | None = None,
-    fmt: str = ''
-) -> list[str]:
-    """
-    List objects in the raw zone for a given source and optional date/format filter.
+    def _object_exists(self, key: str) -> bool:
+        """Check if object exists in S3"""
+        try:
+            self.s3.head_object(Bucket=self.bucket, Key=key)
+            return True
+        except ClientError as e:
+            if e.response['Error']['Code'] == '404':
+                return False
+            raise
 
-    Parameters
-    ----------
-    source : str
-        The source system or dataset name.
-    date : datetime, optional
-        The date partition to filter on.
-    fmt : str, optional
-        File extension filter (e.g., 'parquet', 'csv').
+class RawLayerManager(DataLakeManager):
+    """Raw layer: store data exactly as received."""
+    def __init__(self, source: str):
+        super().__init__(source, DataLakeLayer.RAW)
 
-    Returns
-    -------
-    list of str
-        A list of S3 keys matching the criteria.
+    def _process_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        # No-op: raw data is ingested “as-is”
+        return df
+    
+    def ingest_data(
+        self, df: pd.DataFrame, processing_date: datetime,
+        fmt: str, partition_cols: Optional[Dict[str, str]] = None,
+        metadata: Optional[Dict[str, str]] = None,
+        source_key: Optional[str] = None
+    ) -> str:
+        # For raw, preserve original bytes if source_key provided
+        if source_key and fmt.lower() == 'parquet':
+            raw_obj = self.s3.get_object(Bucket=self.bucket, Key=source_key)['Body'].read()
+            key = self._generate_key(fmt, processing_date, partition_cols)
+            meta = metadata or {}
+            meta.update({'source': self.source, 'layer': self.layer, 'format': fmt})
+            self.s3.put_object(Bucket=self.bucket, Key=key, Body=raw_obj, Metadata=meta)
+            logger.info(f"Raw parquet preserved to s3://{self.bucket}/{key}")
+            return key
+        # fallback to DataFrame serialization
+        return super().ingest_data(df, processing_date, fmt, partition_cols, metadata)
 
-    Raises
-    ------
-    botocore.exceptions.ClientError
-        If listing objects in S3 fails.
-    """
-    prefix = f"raw/{source}/"
-    if date:
-        prefix += f"year={date:%Y}/month={date:%m}/day={date:%d}/"
+class BronzeLayerManager(DataLakeManager):
+    def __init__(self, source: str):
+        super().__init__(source, DataLakeLayer.BRONZE)
+
+    def _process_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        return df
+
+class SilverLayerManager(DataLakeManager):
+    def __init__(
+        self, source: str,
+        transform_fn: Callable[[pd.DataFrame], pd.DataFrame] = lambda df: df
+    ):
+        super().__init__(source, DataLakeLayer.SILVER)
+        self.transform_fn = transform_fn
+
+    def _validate_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        return df
+
+    def _process_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        return self.transform_fn(df)
+
+
+def process_layer(layer: str, source: str, processing_date: datetime, transform_fn: Optional[Callable] = None) -> bool:
     try:
-        paginator = S3_CLIENT.get_paginator('list_objects_v2')
-        pages = paginator.paginate(Bucket=DEFAULT_BUCKET, Prefix=prefix)
-        keys = [
-            obj['Key']
-            for page in pages if 'Contents' in page
-            for obj in page['Contents']
-            if not fmt or obj['Key'].endswith(f".{fmt}")
-        ]
-        return keys
-    except ClientError as e:
-        logger.error(f"Error listing raw objects at {prefix}: {e}")
-        raise
-
-def check_raw_object_exists(
-    key: str,
-    bucket: str = DEFAULT_BUCKET
-) -> bool:
-    """
-    Check if a raw object exists in S3.
-
-    Parameters
-    ----------
-    key : str
-        The S3 object key to check.
-    bucket : str, optional
-        The S3 bucket name. Defaults to DEFAULT_BUCKET.
-
-    Returns
-    -------
-    bool
-        True if the object exists, False if a 404 error is returned.
-
-    Raises
-    ------
-    botocore.exceptions.ClientError
-        For errors other than 404 (not found).
-    """
-    try:
-        S3_CLIENT.head_object(Bucket=bucket, Key=key)
+        if layer == DataLakeLayer.RAW:
+            # Example usage: ingest pre-loaded df with original format and source_key
+            pass  # implement as needed
+        elif layer == DataLakeLayer.BRONZE:
+            man = BronzeLayerManager(source)
+            df = man.load_from_previous_layer(processing_date)
+            man.ingest_data(df, processing_date)
+        elif layer == DataLakeLayer.SILVER:
+            man = SilverLayerManager(source, transform_fn or (lambda df: df))
+            df = man.load_from_previous_layer(processing_date)
+            man.ingest_data(df, processing_date)
         return True
-    except ClientError as e:
-        if e.response['Error']['Code'] == '404':
-            return False
-        logger.error(f"Unexpected error checking {key}: {e}")
-        raise
+    except Exception as e:
+        logger.error(f"Error processing {layer}: {e}")
+        return False
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Data Lake Pipeline')
+    parser.add_argument('--source', required=True)
+    parser.add_argument(
+        '--layer', required=True,
+        choices=[DataLakeLayer.RAW, DataLakeLayer.BRONZE, DataLakeLayer.SILVER]
+    )
+    parser.add_argument('--date', help='YYYY-MM-DD')
+    args = parser.parse_args()
+
+    date = datetime.strptime(args.date, '%Y-%m-%d') if args.date else datetime.now() - timedelta(days=1)
+    logger.info(f"Starting {args.layer} for {args.source} on {date:%Y-%m-%d}")
+    ok = process_layer(args.layer, args.source, date)
+    return 0 if ok else 1
+
+if __name__ == '__main__':
+    exit(main())
